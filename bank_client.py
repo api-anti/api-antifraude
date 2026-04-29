@@ -5,11 +5,15 @@ import hashlib
 import uuid
 import requests
 
-API_URL = "https://api-antifraude.onrender.com"
+API_URL = "https://api.antifraude-api.com"
 
 # Banque CHECK : Cofidis
 API_KEY = "key_cofidis_check"
 SIGN_SECRET = "sig_cofidis_secret"
+
+# Cloudflare Service Token
+CF_CLIENT_ID = "COLLE_ICI_TON_CLIENT_ID"
+CF_CLIENT_SECRET = "COLLE_ICI_TON_CLIENT_SECRET"
 
 
 def generate_signature(timestamp: str, body: dict) -> str:
@@ -40,6 +44,8 @@ def check_client(nom, prenom, date_naissance, code_postal):
     signature = generate_signature(timestamp, body)
 
     headers = {
+        "CF-Access-Client-Id": CF_CLIENT_ID,
+        "CF-Access-Client-Secret": CF_CLIENT_SECRET,
         "x-api-key": API_KEY,
         "x-timestamp": timestamp,
         "x-signature": signature,
@@ -55,8 +61,8 @@ def check_client(nom, prenom, date_naissance, code_postal):
             timeout=10
         )
 
-        print("Status code:", response.status_code)
-        print("Response:", response.text)
+        print("CHECK STATUS:", response.status_code)
+        print("CHECK RESPONSE:", response.text)
 
     except Exception as e:
         print("ERREUR :", str(e))

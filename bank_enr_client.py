@@ -5,14 +5,24 @@ import hashlib
 import uuid
 import requests
 
-API_URL = "https://api-antifraude.onrender.com"
+API_URL = "https://api.antifraude-api.com"
 
+# Banque ENR : Domofinance
 API_KEY = "key_domofinance_enr"
 SIGN_SECRET = "sig_domofinance_secret"
 
+# Cloudflare Service Token
+CF_CLIENT_ID = "COLLE_ICI_TON_CLIENT_ID"
+CF_CLIENT_SECRET = "COLLE_ICI_TON_CLIENT_SECRET"
+
 
 def sign(timestamp, body):
-    body_bytes = json.dumps(body, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    body_bytes = json.dumps(
+        body,
+        separators=(",", ":"),
+        ensure_ascii=False
+    ).encode("utf-8")
+
     message = timestamp.encode("utf-8") + b"." + body_bytes
 
     return hmac.new(
@@ -34,6 +44,8 @@ def generate_token(nom, prenom, dn, cp):
     signature = sign(timestamp, body)
 
     headers = {
+        "CF-Access-Client-Id": CF_CLIENT_ID,
+        "CF-Access-Client-Secret": CF_CLIENT_SECRET,
         "x-api-key": API_KEY,
         "x-timestamp": timestamp,
         "x-signature": signature,
@@ -67,6 +79,8 @@ def deposit_token(token):
     signature = sign(timestamp, body)
 
     headers = {
+        "CF-Access-Client-Id": CF_CLIENT_ID,
+        "CF-Access-Client-Secret": CF_CLIENT_SECRET,
         "x-api-key": API_KEY,
         "x-timestamp": timestamp,
         "x-signature": signature,
