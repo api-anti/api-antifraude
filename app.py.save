@@ -1,0 +1,460 @@
+import os
+import time
+import math
+import secrets
+import hashlib
+import unicodedata
+import psycopg2
+from datetime import datetime
+from collections import defaultdict
+from fastapi import FastAPI, Header, HTTPException
+from pydantic import BaseModel
+
+app = FastAPI()
+
+# =========================
+# ENV / SECRETS HASHÉS
+# =========================
+
+DATABASE_URL = os.getenv("DATABASE_URL")
+K_MACHINE = int(os.getenv("K_MACHINE", "0"))
+
+KEY_HASHES = {
+    os.getenv("KEY_DOMOFINANCE_HASH"): {"name": "Domofinance", "role": "ENR"},
+    os.getenv("KEY_PROJEXIO_HASH"): {"name": "Projexio", "role": "ENR"},
+    os.getenv("KEY_COFIDIS_HASH"): {"name": "Cofidis", "role": "CHECK"},
+    os.getenv("KEY_YOUNITED_HASH"): {"name": "Younited", "role": "CHECK"},
+}
+KEY_HASHES = {k: v for k, v in KEY_HASHES.items() if k}
+
+ADMIN_KEY_HASH = os.getenv("ADMIN_KEY_HASH")
+
+
+# =========================
+# AUTH HASHÉE
+# =========================
+
+def hash_key(key: str):
+    return hashlib.sha256(key.encode("utf-8")).hexdigest()
+
+
+def verifier_api_key(x_api_key: str):
+    if not x_api_key:
+        raise HTTPException(status_code=401, detail="Clé API manquante")
+
+    key_hash = hash_key(x_api_key)
+    info = KEY_HASHES.get(key_hash)
+
+    if info is None:
+        raise HTTPException(status_code=401, detail="Clé API invalide")
+
+    return info
+
+
+def verifier_admin(x_api_key: str):
+    if not x_api_key:
+        raise HTTPException(status_code=401, detail="Clé admin manquante")
+
+    if hash_key(x_api_key) != ADMIN_KEY_HASH:
+        raise HTTPException(status_code=403, detail="Accès admin interdit")
+
+    return True
+
+
+# =========================
+# DATABASE
+# =========================
+
+def get_db():
+    if not DATABASE_URL:
+        raise HTTPException(status_code=500, detail="DATABASE_URL non configurée")
+    return psycopg2.connect(DATABASE_URL)
+
+
+def init_db():
+    conn = get_db()
+    cur = conn.cursor()
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS enr_tokens (
+            id SERIAL PRIMARY KEY,
+            token_hash TEXT UNIQUE NOT NULL,
+            created_by_bank TEXT NOT NULL,
+            created_at TIMESTAMP NOT NULL
+        );
+    """)
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS checks (
+            id SERIAL PRIMARY KEY,
+            check_id TEXT UNIQUE NOT NULL,
+            bank TEXT NOT NULL,
+            result TEXT NOT NULL,
+            created_at TIMESTAMP NOT NULL
+        );
+    """)
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS audit_logs (
+            id SERIAL PRIMARY KEY,
+            action TEXT NOT NULL,
+            bank TEXT NOT NULL,
+            result TEXT,
+            token_preview TEXT,
+            check_id TEXT,
+            created_at TIMESTAMP NOT NULL
+        );
+    """)
+
+    conn.commit()
+    cur.close()
+    conn.close()
+
+
+@app.on_event("startup")
+def startup():
+    init_db()
+
+
+# =========================
+# OPRF SIMPLIFIÉ
+# =========================
+
+P = 208351617316091241234326746312124448251235562226470491514186331217050270460481
+
+
+def machine_oprf(blinded_value):
+    if K_MACHINE == 0:
+        raise HTTPException(status_code=500, detail="K_MACHINE non configuré")
+    return pow(blinded_value, K_MACHINE, P)
+
+
+# =========================
+# TOKENISATION
+# =========================
+
+def clean_text(value):
+    value = value.strip().upper()
+    value = unicodedata.normalize("NFD", value)
+    value = "".join(c for c in value if unicodedata.category(c) != "Mn")
+    return " ".join(value.split())
+
+
+def normalize_client(nom, prenom, date_naissance, code_postal):
+    return f"{clean_text(nom)}|{clean_text(prenom)}|{date_naissance}|{code_postal.strip()}"
+
+
+def hash_to_number(identity):
+    h = hashlib.sha256(identity.encode("utf-8")).hexdigest()
+    return int(h, 16) % P
+
+
+def random_blinding_factor():
+    while True:
+        r = secrets.randbelow(P - 2) + 1
+        if math.gcd(r, P - 1) == 1:
+            return r
+
+
+def banque_genere_token(nom, prenom, date_naissance, code_postal):
+    identity = normalize_client(nom, prenom, date_naissance, code_postal)
+    x = hash_to_number(identity)
+
+    r = random_blinding_factor()
+    x_blind = pow(x, r, P)
+
+    y_blind = machine_oprf(x_blind)
+
+    r_inverse = pow(r, -1, P - 1)
+    y = pow(y_blind, r_inverse, P)
+
+    return hashlib.sha256(str(y).encode("utf-8")).hexdigest()
+
+
+# =========================
+# MODELS
+# =========================
+
+class ClientRequest(BaseModel):
+    nom: str
+    prenom: str
+    date_naissance: str
+    code_postal: str
+
+
+class TokenRequest(BaseModel):
+    token: str
+
+
+# =========================
+# RATE LIMIT
+# =========================
+
+rate_limit = defaultdict(list)
+
+
+# =========================
+# HELPERS DB
+# =========================
+
+def token_exists(token):
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("SELECT 1 FROM enr_tokens WHERE token_hash = %s LIMIT 1;", (token,))
+    exists = cur.fetchone() is not None
+    cur.close()
+    conn.close()
+    return exists
+
+
+def count_tokens():
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("SELECT COUNT(*) FROM enr_tokens;")
+    count = cur.fetchone()[0]
+    cur.close()
+    conn.close()
+    return count
+
+
+def next_check_id():
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("SELECT COUNT(*) FROM checks;")
+    count = cur.fetchone()[0] + 1
+    cur.close()
+    conn.close()
+    return f"CHECK-{count:06d}"
+
+
+def add_audit_log(action, bank, result=None, token_preview=None, check_id=None):
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        INSERT INTO audit_logs (action, bank, result, token_preview, check_id, created_at)
+        VALUES (%s, %s, %s, %s, %s, %s);
+        """,
+        (action, bank, result, token_preview, check_id, datetime.now())
+    )
+    conn.commit()
+    cur.close()
+    conn.close()
+
+
+# =========================
+# ROUTES
+# =========================
+
+@app.get("/")
+def accueil():
+    return {"message": "API anti-fraude ENR active"}
+
+
+@app.get("/status")
+def status():
+    return {
+        "status": "online",
+        "service": "API anti-fraude ENR",
+        "database": "connected" if DATABASE_URL else "missing",
+        "auth": "hashed"
+    }
+
+
+@app.get("/stats")
+def stats(x_api_key: str = Header(None)):
+    verifier_api_key(x_api_key)
+
+    conn = get_db()
+    cur = conn.cursor()
+
+    cur.execute("SELECT COUNT(*) FROM checks;")
+    total_checks = cur.fetchone()[0]
+
+    cur.execute("SELECT COUNT(*) FROM enr_tokens;")
+    total_tokens = cur.fetchone()[0]
+
+    cur.close()
+    conn.close()
+
+    return {
+        "tokens_enr_count": total_tokens,
+        "total_checks": total_checks
+    }
+
+
+@app.post("/check")
+def check_client(data: ClientRequest, x_api_key: str = Header(None)):
+    info = verifier_api_key(x_api_key)
+
+    if info["role"] != "CHECK":
+        raise HTTPException(status_code=403, detail="Accès interdit")
+
+    banque = info["name"]
+
+    now = time.time()
+    calls = rate_limit[x_api_key]
+    rate_limit[x_api_key] = [t for t in calls if now - t < 60]
+
+    if len(rate_limit[x_api_key]) > 20:
+
+    rate_limit[x_api_key].append(now)
+
+    token = banque_genere_token(
+        data.nom,
+        data.prenom,
+        data.date_naissance,
+        data.code_postal
+    )
+
+    resultat = "HIGH" if token_exists(token) else "LOW"
+    check_id = next_check_id()
+
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        INSERT INTO checks (check_id, bank, result, created_at)
+        VALUES (%s, %s, %s, %s);
+        """,
+        (check_id, banque, resultat, datetime.now())
+    )
+    conn.commit()
+    cur.close()
+    conn.close()
+
+    add_audit_log("check", banque, result=resultat, check_id=check_id)
+
+    return {
+        "check_id": check_id,
+        "result": resultat
+    }
+
+
+@app.post("/deposit-token")
+def deposit_token(data: TokenRequest, x_api_key: str = Header(None)):
+    info = verifier_api_key(x_api_key)
+
+    if info["role"] != "ENR":
+        raise HTTPException(status_code=403, detail="Accès interdit")
+
+    banque = info["name"]
+
+    conn = get_db()
+    cur = conn.cursor()
+
+    try:
+        cur.execute(
+            """
+            INSERT INTO enr_tokens (token_hash, created_by_bank, created_at)
+            VALUES (%s, %s, %s);
+            """,
+            (data.token, banque, datetime.now())
+        )
+        conn.commit()
+        message = "Token ajouté"
+
+    except psycopg2.errors.UniqueViolation:
+        conn.rollback()
+        message = "Token déjà existant"
+
+    cur.close()
+    conn.close()
+
+    add_audit_log(
+        "deposit",
+        banque,
+        token_preview=data.token[:10] + "..."
+    )
+
+    return {
+        "message": message,
+        "banque": banque,
+        "total_tokens": count_tokens()
+    }
+
+
+@app.get("/admin/logs")
+def admin_logs(x_api_key: str = Header(None)):
+    verifier_admin(x_api_key)
+
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT action, bank, result, token_preview, check_id, created_at
+        FROM audit_logs
+        ORDER BY id DESC
+        LIMIT 100;
+    """)
+
+    rows = cur.fetchall()
+    cur.close()
+    conn.close()
+
+    logs = []
+    for row in rows:
+        logs.append({
+            "action": row[0],
+            "bank": row[1],
+            "result": row[2],
+            "token_preview": row[3],
+            "check_id": row[4],
+            "created_at": str(row[5])
+        })
+
+    return {"logs": logs}
+
+
+@app.get("/admin/stats")
+def admin_stats(x_api_key: str = Header(None)):
+    verifier_admin(x_api_key)
+
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT bank, result, COUNT(*)
+        FROM checks
+        GROUP BY bank, result;
+    """)
+
+    rows = cur.fetchall()
+    cur.close()
+    conn.close()
+
+    stats_data = {}
+
+    for bank, result, count in rows:
+        if bank not in stats_data:
+            stats_data[bank] = {"total": 0, "HIGH": 0, "LOW": 0}
+
+        stats_data[bank]["total"] += count
+        stats_data[bank][result] = count
+
+    return {"stats_par_banque": stats_data}
+
+
+@app.get("/admin/billing")
+def admin_billing(x_api_key: str = Header(None)):
+    verifier_admin(x_api_key)
+
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT bank, COUNT(*)
+        FROM checks
+        GROUP BY bank;
+    """)
+
+    rows = cur.fetchall()
+    cur.close()
+    conn.close()
+
+    billing = {}
+
+    for bank, total in rows:
+        billing[bank] = {
+            "total_calls": total,
+            "amount_eur": round(total * 0.01, 2)
+        }
+
+    return billing
