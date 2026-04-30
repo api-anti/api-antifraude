@@ -5,8 +5,7 @@ import hashlib
 import uuid
 import requests
 
-API_URL = "https://api.antifraude-api.com"
-
+API_URL = "https://api-antifraude.onrender.com"
 # Banque CHECK : Cofidis
 API_KEY = "key_cofidis_check"
 SIGN_SECRET = "sig_cofidis_secret"

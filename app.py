@@ -283,3 +283,37 @@ def verify(x_api_key: str = Header(None)):
         prev = c
 
     return {"valid": True, "logs": len(rows)}
+# =========================
+# V1 ROUTES (PRO BANK)
+# =========================
+
+@app.post("/v1/generate-token")
+async def v1_generate_token(
+    request: Request,
+    x_api_key: str = Header(...),
+    x_timestamp: str = Header(...),
+    x_signature: str = Header(...)
+):
+    return await generate_token(request, x_api_key, x_timestamp, x_signature)
+
+
+@app.post("/v1/deposit-token")
+async def v1_deposit_token(
+    request: Request,
+    x_api_key: str = Header(...),
+    x_timestamp: str = Header(...),
+    x_signature: str = Header(...),
+    x_idempotency_key: str = Header(...)
+):
+    return await deposit_token(request, x_api_key, x_timestamp, x_signature, x_idempotency_key)
+
+
+@app.post("/v1/check")
+async def v1_check(
+    request: Request,
+    x_api_key: str = Header(...),
+    x_timestamp: str = Header(...),
+    x_signature: str = Header(...),
+    x_idempotency_key: str = Header(...)
+):
+    return await check(request, x_api_key, x_timestamp, x_signature, x_idempotency_key)

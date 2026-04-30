@@ -5,8 +5,7 @@ import hashlib
 import uuid
 import requests
 
-API_URL = "https://api.antifraude-api.com"
-
+API_URL = "https://api-antifraude.onrender.com"
 # Banque ENR : Domofinance
 API_KEY = "key_domofinance_enr"
 SIGN_SECRET = "sig_domofinance_secret"
